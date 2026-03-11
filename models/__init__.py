@@ -1,1 +1,0 @@
-from models.sfhformer_lol import sfhformer_t,sfhformer_lol_l, sfhformer_lol_m, sfhformer_lol_s
