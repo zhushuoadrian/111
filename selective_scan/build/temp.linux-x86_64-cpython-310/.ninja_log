@@ -1,4 +1,0 @@
-# ninja log v7
-1	19000	1773224871892435713	/home/leng/data/almzqfl/the02/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/cusoflex/selective_scan_core_fwd.o	2c0a5183ca51446e
-1	23839	1773224871892435713	/home/leng/data/almzqfl/the02/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/cusoflex/selective_scan_oflex.o	e32b9f4dc6bb8a92
-1	55120	1773224871892435713	/home/leng/data/almzqfl/the02/selective_scan/build/temp.linux-x86_64-cpython-310/csrc/selective_scan/cusoflex/selective_scan_core_bwd.o	417e73df4f3baf0e
