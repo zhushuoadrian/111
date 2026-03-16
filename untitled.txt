@@ -1,4 +1,0 @@
-PSNR: 26.85, SSIM: 0.9422, LPIPS: 0.0452
-
-PSNR: 26.30, SSIM: 0.9401, LPIPS: 0.0475
-测试完成！图片已保存到: /home/leng/data/almz
