@@ -1,5 +1,5 @@
 # -----------------------------------------------------------------------------------
-# 🏆 冲刺 27+ 霸榜版: WaveMamba + NAFNet + Bi-CSG + 平滑像素先验 + 伪影消除
+# 🏆 冲刺 27+ 霸榜版 V2: WaveMamba + NAFNet + Bi-CSG + 平滑像素先验 + 伪影消除
 # -----------------------------------------------------------------------------------
 import math
 import torch
@@ -77,6 +77,7 @@ class NAFBlock(nn.Module):
         self.sca = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(dw_channel // 2, dw_channel // 2, 1, padding=0, bias=True),
+            nn.Sigmoid(),
         )
         self.sg = SimpleGate()
 
@@ -96,8 +97,11 @@ class NAFBlock(nn.Module):
     def forward(self, inp):
         x = inp.permute(0, 2, 3, 1)
         x = self.norm1(x).permute(0, 3, 1, 2)
-        
-        x = self.conv3(self.sca(self.sg(self.conv2(self.conv1(x)))) * self.sg(self.conv2(self.conv1(x))))
+
+        # 🔧 修复: conv1+conv2 只计算一次，避免梯度翻倍 (原代码调用两次导致梯度×2)
+        x_dw = self.conv2(self.conv1(x))
+        x_sg = self.sg(x_dw)                          # SimpleGate → dw_channel//2
+        x = self.conv3(self.sca(x_sg) * x_sg)         # SCA 注意力 × 门控特征
         y = inp + self.dropout1(x) * self.beta
 
         x = self.conv4(self.norm2(y.permute(0, 2, 3, 1)).permute(0, 3, 1, 2))
@@ -142,11 +146,13 @@ class LFSSBlock(nn.Module):
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16):
         super().__init__()
+        # 🔧 修复: 保证瓶颈至少 4 通道，避免 in_planes=32 时瓶颈只有 2 通道
+        reduced = max(in_planes // ratio, 4)
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
-        self.fc1   = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.fc1   = nn.Conv2d(in_planes, reduced, 1, bias=False)
         self.relu1 = nn.ReLU()
-        self.fc2   = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        self.fc2   = nn.Conv2d(reduced, in_planes, 1, bias=False)
         self.sigmoid = nn.Sigmoid()
     def forward(self, x):
         avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
@@ -231,6 +237,9 @@ class ASPP(nn.Module):
 class BiCSG_Fusion(nn.Module):
     def __init__(self, dim):
         super().__init__()
+        # 🔧 增加 LayerNorm，防止注意力输入激活值爆炸，稳定训练
+        self.norm_l = nn.LayerNorm(dim)
+        self.norm_h = nn.LayerNorm(dim * 3)
         # 引入 depthwise group conv，增强空间对齐
         self.l2h_conv = nn.Sequential(nn.Conv2d(dim, dim*3, 3, 1, 1, groups=dim), nn.GELU(), nn.Conv2d(dim*3, dim*3, 1), nn.Sigmoid())
         self.h2l_conv = nn.Sequential(nn.Conv2d(dim*3, dim, 3, 1, 1), nn.GELU(), nn.Conv2d(dim, dim, 1), nn.Sigmoid())
@@ -239,10 +248,14 @@ class BiCSG_Fusion(nn.Module):
         self.out_l = nn.Conv2d(dim, dim, 1)
 
     def forward(self, x_l, x_h):
-        attn_l = self.l2h_conv(x_l)
+        # 归一化后再计算注意力权重
+        x_l_n = self.norm_l(x_l.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x_h_n = self.norm_h(x_h.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+        attn_l = self.l2h_conv(x_l_n)
         x_h_refined = x_h * attn_l + x_h
         
-        attn_h = self.h2l_conv(x_h)
+        attn_h = self.h2l_conv(x_h_n)
         x_l_refined = x_l * attn_h + x_l
         
         return self.out_l(x_l_refined), self.out_h(x_h_refined)
@@ -282,7 +295,8 @@ class GatedRefine(nn.Module):
         self.project_in = nn.Conv2d(dim, dim * 2, 1)
         self.sg = SimpleGate()
         self.dwconv = nn.Conv2d(dim, dim, 3, 1, 1, groups=dim)
-        self.sca = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dim, dim, 1))
+        # 🔧 修复: 加 Sigmoid 让 SCA 输出有界 [0,1]，充当真正的注意力权重
+        self.sca = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dim, dim, 1), nn.Sigmoid())
         self.project_out = nn.Conv2d(dim, dim, 1)
         self.norm = nn.LayerNorm(dim)
 
@@ -337,23 +351,28 @@ class WaveParallelStage_v2(nn.Module):
 class IlluminationEstimator(nn.Module):
     """
     回归物理本质：直接生成 3 通道 (RGB) 的像素级照度缩放图。
-    自带 5x5 平滑，防止原图的高频噪声被同比例放大！
+    🔧 改进: 增加一个隐藏层 (3→16→32→3)，提升表达能力；
+    同时用 3×3 + 5×5 双尺度均值平滑，比单一 5×5 更自然。
     """
     def __init__(self, in_chans=3):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_chans, 16, 3, 1, 1),
             nn.GELU(),
-            nn.Conv2d(16, 3, 3, 1, 1) # 输出 3 通道，顺带做初始色彩校正
+            nn.Conv2d(16, 32, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(32, 3, 3, 1, 1),  # 输出 3 通道，顺带做初始色彩校正
         )
-        nn.init.zeros_(self.net[2].weight)
-        nn.init.zeros_(self.net[2].bias)
+        nn.init.zeros_(self.net[4].weight)
+        nn.init.zeros_(self.net[4].bias)
 
     def forward(self, x):
-        # 初始默认像素提亮 5.0 倍
-        illu_map = torch.sigmoid(self.net(x)) * 8.0 + 1.0 
-        # 强制平滑照度图，让光照变化柔和，避免放大马赛克和噪点
-        illu_map = F.avg_pool2d(illu_map, kernel_size=5, stride=1, padding=2)
+        # sigmoid → [1.0, 9.0]，初始化后默认 5.0 倍提亮
+        illu_map = torch.sigmoid(self.net(x)) * 8.0 + 1.0
+        # 🔧 双尺度平滑: 3×3 局部细节 + 5×5 大范围光照，融合后更自然
+        illu_smooth3 = F.avg_pool2d(illu_map, kernel_size=3, stride=1, padding=1)
+        illu_smooth5 = F.avg_pool2d(illu_map, kernel_size=5, stride=1, padding=2)
+        illu_map = 0.5 * illu_smooth3 + 0.5 * illu_smooth5
         return illu_map
 
 # ===================================================================================
@@ -394,9 +413,11 @@ class Backbone_v2(nn.Module):
 
         # 消除 PixelShuffle 带来的棋盘格伪影
         self.refine_out = nn.Sequential(
-            nn.Conv2d(out_chans, 16, 3, 1, 1),
+            nn.Conv2d(out_chans, 32, 3, 1, 1),
             nn.GELU(),
-            nn.Conv2d(16, out_chans, 3, 1, 1)
+            nn.Conv2d(32, 32, 3, 1, 1, groups=32),  # depthwise
+            nn.GELU(),
+            nn.Conv2d(32, out_chans, 3, 1, 1),
         )
 
     def forward(self, x):
@@ -404,15 +425,15 @@ class Backbone_v2(nn.Module):
         illu_map = self.illu_estimator(x)
         x_bright = x * illu_map 
         
-        # 2. 网络专注去噪和色彩微调
+        # 2. 编码器 (skip 在各层处理后保存，携带更丰富的语义特征)
         feat = self.patch_embed(x_bright)
-        copy1 = feat
 
         feat = self.layer1(feat)
+        copy1 = feat                     # 🔧 修复: 保存在 layer1 之后，而非之前
         feat = self.downsample1(feat)
         
-        copy2 = feat
         feat = self.layer2(feat)
+        copy2 = feat                     # 🔧 修复: 保存在 layer2 之后，而非之前
         feat = self.downsample2(feat)
         
         # 3. 瓶颈层 ASPP
@@ -430,9 +451,9 @@ class Backbone_v2(nn.Module):
         feat = self.refine1(feat)
         feat = self.layer5(feat)
         
-        # 5. 消除伪影残差输出
+        # 5. 消除伪影残差输出 (🔧 修复: 加上 refine_out 自身的残差连接)
         residual = self.patch_unembed(feat)
-        residual = self.refine_out(residual) 
+        residual = residual + self.refine_out(residual)
         
         # 加在 x_bright 上，让 residual 学的东西尽量微小
         return x_bright + residual
@@ -441,10 +462,11 @@ class Backbone_v2(nn.Module):
 # 8. 模型定义
 # -----------------------------------------------------------------------------------
 def sfhformer_lol_s(**kwargs): 
-    return Backbone_v2(embed_dim=[32, 64, 128, 64, 32], depth=[2, 2, 2, 2, 2], **kwargs)
+    # 🔧 改进: 瓶颈层加深 [2,2,4,2,2]，提升特征提取能力
+    return Backbone_v2(embed_dim=[32, 64, 128, 64, 32], depth=[2, 2, 4, 2, 2], **kwargs)
 
 def sfhformer_t(**kwargs): 
-    return Backbone_v2(embed_dim=[32, 64, 128, 64, 32], depth=[2, 2, 2, 2, 2], **kwargs)
+    return Backbone_v2(embed_dim=[32, 64, 128, 64, 32], depth=[2, 2, 4, 2, 2], **kwargs)
 
 def sfhformer_lol_m(**kwargs):
     return Backbone_v2(embed_dim=[48, 96, 192, 96, 48], depth=[2, 2, 4, 2, 2], **kwargs)
