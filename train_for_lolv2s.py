@@ -13,12 +13,24 @@ from tqdm import tqdm
 from utils import AverageMeter
 from datasets.LoL_DataLoader import TrainData_for_LOLv2Synthetic, TestData_for_LOLv2Synthetic
 from numpy import *
-from pytorch_msssim import ssim
+from pytorch_msssim import ssim, SSIM
 from models import *
 import random
 import numpy as np
 # [New] 引入 EMA 模块
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+
+
+# ============== Charbonnier Loss ==============
+class CharbonnierLoss(nn.Module):
+    def __init__(self, eps=1e-3):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x, y):
+        diff = x - y
+        return torch.mean(torch.sqrt(diff * diff + self.eps * self.eps))
+# =============================================
 
 # ============== 固定随机种子函数 ==============
 def set_seed(seed=8001):
@@ -47,8 +59,8 @@ parser.add_argument('--log_dir', default='./logs/', type=str, help='path to logs
 parser.add_argument('--exp', default='lowlight', type=str, help='experiment setting')
 args = parser.parse_args()
 
-# [Modified] 增加了 ema_model 参数
-def train(train_loader, network, criterion, optimizer, ema_model):
+# [Modified] 增加了 ema_model 参数，criterion_char 和 criterion_ssim
+def train(train_loader, network, criterion_char, criterion_ssim, optimizer, ema_model):
     losses = AverageMeter()
 
     torch.cuda.empty_cache()
@@ -65,19 +77,22 @@ def train(train_loader, network, criterion, optimizer, ema_model):
         pred_img = network(source_img)
         label_img = target_img
         
-        # 1. 内容损失
-        loss_content = criterion(pred_img, label_img)
+        # 1. Charbonnier 内容损失
+        loss_content = criterion_char(pred_img, label_img)
 
-        # 2. FFT 损失
-        label_fft3 = torch.fft.fft2(label_img, dim=(-2, -1))
-        label_fft3 = torch.stack((label_fft3.real, label_fft3.imag), -1)
+        # 2. SSIM 损失
+        loss_ssim = 1 - criterion_ssim(pred_img, label_img)
 
-        pred_fft3 = torch.fft.fft2(pred_img, dim=(-2, -1))
-        pred_fft3 = torch.stack((pred_fft3.real, pred_fft3.imag), -1)
+        # 3. FFT 损失
+        label_fft = torch.fft.fft2(label_img, dim=(-2, -1))
+        label_fft = torch.stack((label_fft.real, label_fft.imag), -1)
 
-        loss_fft = criterion(pred_fft3, label_fft3)
+        pred_fft = torch.fft.fft2(pred_img, dim=(-2, -1))
+        pred_fft = torch.stack((pred_fft.real, pred_fft.imag), -1)
 
-        loss = loss_content + 0.1 * loss_fft
+        loss_fft = criterion_char(pred_fft, label_fft)
+
+        loss = loss_content + 0.2 * loss_ssim + 0.05 * loss_fft
 
         # 🔥【关键修改 1】NaN 熔断机制 🔥
         # 如果 Loss 变成 NaN 或者 Inf，直接跳过这一步更新！防止模型崩坏。
@@ -91,9 +106,8 @@ def train(train_loader, network, criterion, optimizer, ema_model):
         optimizer.zero_grad()
         loss.backward()
         
-        # 🔥【关键修改 2】收紧梯度裁剪 (0.5 -> 0.1)
-        # 对于曾出现崩塌的模型，0.1 更安全。
-        torch.nn.utils.clip_grad_norm_(network.parameters(), 0.1)
+        # 🔥【关键修改 2】梯度裁剪 0.1 → 1.0
+        torch.nn.utils.clip_grad_norm_(network.parameters(), 1.0)
         
         optimizer.step()
 
@@ -139,25 +153,36 @@ if __name__ == '__main__':
 
     device_index = [0]
     network = eval(args.model.replace('-', '_'))()
-    network = nn.DataParallel(network, device_ids=device_index).cuda()
+    network = network.cuda()
 
     # [New] 初始化 EMA 模型
     # decay=0.999 适合小数据集防止过拟合
     ema_model = AveragedModel(network, multi_avg_fn=get_ema_multi_avg_fn(0.999))
 
-    criterion = nn.L1Loss()
+    criterion_char = CharbonnierLoss().cuda()
+    criterion_ssim = SSIM(data_range=1.0, size_average=True, channel=3).cuda()
 
     if setting['optimizer'] == 'adamw':
-        optimizer = torch.optim.AdamW(network.parameters(), lr=1e-3, betas=(0.9, 0.999))
+        optimizer = torch.optim.AdamW(network.parameters(), lr=setting['lr'], betas=(0.9, 0.999), weight_decay=1e-4)
     elif setting['optimizer'] == 'adam':
         optimizer = torch.optim.Adam(network.parameters(), lr=setting['lr'])
     else:
         raise Exception("ERROR: unsupported optimizer")
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # 5 epoch 线性 warmup + cosine 退火
+    warmup_epochs = 5
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=setting['epochs'],
+        T_max=setting['epochs'] - warmup_epochs,
         eta_min=1e-6
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs]
     )
 
     # ============== 固定 DataLoader 的随机种子 ==============
@@ -174,7 +199,7 @@ if __name__ == '__main__':
     train_data_dir = '/home/leng/data/qtacefz/data/LOLv2/Synthetic/Train'
     test_data_dir = '/home/leng/data/qtacefz/data/LOLv2/Synthetic/Test'
     
-    train_dataset = TrainData_for_LOLv2Synthetic(128, train_data_dir)
+    train_dataset = TrainData_for_LOLv2Synthetic(setting['patch_size'], train_data_dir)
     train_loader = DataLoader(train_dataset,
                               batch_size=setting['batch_size'],
                               shuffle=True,
@@ -185,7 +210,7 @@ if __name__ == '__main__':
                               worker_init_fn=worker_init_fn)
     test_dataset = TestData_for_LOLv2Synthetic(8, test_data_dir)
     test_loader = DataLoader(test_dataset,
-                             batch_size=25,
+                             batch_size=1,
                              shuffle=False,
                              num_workers=args.num_workers,
                              pin_memory=True,
@@ -207,7 +232,7 @@ if __name__ == '__main__':
         best_ssim_ema = 0
 
         for epoch in tqdm(range(setting['epochs'] + 1)):
-            train_loss = train(train_loader, network, criterion, optimizer, ema_model)
+            train_loss = train(train_loader, network, criterion_char, criterion_ssim, optimizer, ema_model)
             writer.add_scalar('train_loss', train_loss, epoch)
 
             current_lr = optimizer.param_groups[0]['lr']
@@ -244,13 +269,9 @@ if __name__ == '__main__':
                 if avg_psnr_ema > best_psnr_ema:
                     best_psnr_ema = avg_psnr_ema
                     
-                    # 解包逻辑：AveragedModel -> DataParallel -> Module
+                    # 解包逻辑：AveragedModel -> Module（无 DataParallel）
                     if isinstance(ema_model, AveragedModel):
-                        real_model = ema_model.module
-                        if isinstance(real_model, torch.nn.DataParallel):
-                            save_content = real_model.module.state_dict()
-                        else:
-                            save_content = real_model.state_dict()
+                        save_content = ema_model.module.state_dict()
                     else:
                         save_content = ema_model.state_dict()
 
