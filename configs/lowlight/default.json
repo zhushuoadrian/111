@@ -1,0 +1,7 @@
+{
+    "optimizer": "adamw",
+    "lr": 1e-3,
+    "epochs": 300,
+    "batch_size": 8,
+    "eval_freq": 10
+}
