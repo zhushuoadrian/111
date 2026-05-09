@@ -81,7 +81,7 @@ def align_for_test(imgs=[], local_size=32):
 class TrainData(data.Dataset):
     def __init__(self, crop_size, train_data_dir, only_h_flip=False):
         super().__init__()
-        train_list_haze = '/root/lanyun-tmp/data/LOLdataset/our485/low/LIST.TXT'
+        train_list_haze = '/root/lanyun-tmp/SFHformer/data/LOLdataset/our485/low/LIST.TXT'
 
         with open(train_list_haze) as f:
             contents = f.readlines()
@@ -169,7 +169,7 @@ class TrainData_for_FiveK(data.Dataset):
 class TrainData_for_LOLv2Real(data.Dataset):
     def __init__(self, crop_size, train_data_dir, only_h_flip=False):
         super().__init__()
-        train_list_haze = '/root/lanyun-tmp/data/LOLv2/Real_captured/Train/Low/Train.txt'
+        train_list_haze = '/root/lanyun-tmp/SFHformer/data/LOLv2/Real_captured/Train/Low/Train.txt'
         with open(train_list_haze) as f:
             contents = f.readlines()
             haze_names = [i.strip() for i in contents]
@@ -212,7 +212,7 @@ class TrainData_for_LOLv2Real(data.Dataset):
 class TrainData_for_LOLv2Synthetic(data.Dataset):
     def __init__(self, crop_size, train_data_dir, only_h_flip=False):
         super().__init__()
-        train_list_haze = '/root/lanyun-tmp/data/LOLv2/Synthetic/Train.txt'
+        train_list_haze = '/root/lanyun-tmp/SFHformer/data/LOLv2/Synthetic/Train.txt'
         with open(train_list_haze) as f:
             contents = f.readlines()
             haze_names = [line.strip().split()[0] for line in contents]  # low图片名
@@ -255,7 +255,7 @@ class TestData(data.Dataset):
     def __init__(self, local_size, val_data_dir, flag=True):
         super().__init__()
 
-        val_list_haze = '/root/lanyun-tmp/data/LOLdataset/eval15/low/LIST.TXT'
+        val_list_haze = '/root/lanyun-tmp/SFHformer/data/LOLdataset/eval15/low/LIST.TXT'
 
         with open(val_list_haze) as f:
             contents = f.readlines()
@@ -346,7 +346,7 @@ class TestData_for_LOLv2Real(data.Dataset):
     def __init__(self, local_size, val_data_dir, flag=True):
         super().__init__()
 
-        val_list_haze = '/root/lanyun-tmp/data/LOLv2/Real_captured/Test/Low/Test.txt'
+        val_list_haze = '/root/lanyun-tmp/SFHformer/data/LOLv2/Real_captured/Test/Low/Test.txt'
         with open(val_list_haze) as f:
             contents = f.readlines()
             haze_names = [i.strip() for i in contents]
@@ -392,7 +392,7 @@ class TestData_for_LOLv2Synthetic(data.Dataset):
     def __init__(self, local_size, val_data_dir, flag=True):
         super().__init__()
 
-        val_list_haze = '/root/lanyun-tmp/data/LOLv2/Synthetic/Test.txt'
+        val_list_haze = '/root/lanyun-tmp/SFHformer/data/LOLv2/Synthetic/Test.txt'
         with open(val_list_haze) as f:
             contents = f.readlines()
             haze_names = [line.strip().split()[0] for line in contents]  # low图片名

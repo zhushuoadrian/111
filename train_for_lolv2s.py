@@ -6,7 +6,7 @@ import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 from tqdm import tqdm
 from utils import AverageMeter
@@ -17,6 +17,9 @@ from models import *
 import random
 import numpy as np
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+
+# 🔥 导入你提供的 loss_funcs.py 中的感知与边缘损失
+from loss_funcs import PerceptualLoss, EdgeAwareLoss
 
 # ============== 固定随机种子函数 ==============
 def set_seed(seed=8001):
@@ -41,7 +44,6 @@ parser.add_argument('--log_dir', default='./logs/', type=str, help='path to logs
 parser.add_argument('--exp', default='lowlight', type=str, help='experiment setting')
 args = parser.parse_args()
 
-# 🔥 核心修改 1：eps 降至 1e-6，确保 30dB 以上的高精度微调
 class CharbonnierLoss(nn.Module):
     def __init__(self, eps=1e-6):
         super(CharbonnierLoss, self).__init__()
@@ -51,8 +53,8 @@ class CharbonnierLoss(nn.Module):
         loss = torch.mean(torch.sqrt((diff * diff) + (self.eps*self.eps)))
         return loss
 
-# 🔥 核心修改 2：加入 epoch 参数，实现 700 轮动态权重切换
-def train(train_loader, network, criterion_char, criterion_ssim, optimizer, ema_model, epoch):
+# 🔥 核心修改：引入老师模型 (Teacher Model) 和 23dB 的组合 Loss
+def train(train_loader, network, teacher_model, criterion_char, criterion_ssim, criterion_vgg, criterion_edge, optimizer, ema_model, epoch):
     losses = AverageMeter()
 
     torch.cuda.empty_cache()
@@ -64,24 +66,23 @@ def train(train_loader, network, criterion_char, criterion_ssim, optimizer, ema_
         source_img = batch['source'].cuda()
         target_img = batch['target'].cuda()
 
+        # 1. 学生的预测
         pred_img = network(source_img)
         label_img = target_img
         
-        loss_char = criterion_char(pred_img, label_img)
+        # 2. 老师的预测（不计算梯度，纯指导）
+        with torch.no_grad():
+            teacher_pred = teacher_model(source_img).clamp(0.0, 1.0)
+
+        # 3. 计算所有的 Loss
+        loss_l1 = criterion_char(pred_img, label_img)
+        loss_kd = criterion_char(pred_img, teacher_pred)  # 知识蒸馏 Loss（对应他代码的 hvi_loss）
         loss_ssim = 1 - criterion_ssim(pred_img, label_img)
+        loss_vgg = criterion_vgg(pred_img, label_img)
+        loss_edge = criterion_edge(pred_img, label_img)
 
-        # FFT Loss
-        label_fft3 = torch.fft.fft2(label_img, dim=(-2, -1))
-        label_fft3 = torch.stack((label_fft3.real, label_fft3.imag), -1)
-        pred_fft3 = torch.fft.fft2(pred_img, dim=(-2, -1))
-        pred_fft3 = torch.stack((pred_fft3.real, pred_fft3.imag), -1)
-        loss_fft = criterion_char(pred_fft3, label_fft3) 
-
-        # 🔥 700 轮冲刺策略：削弱 SSIM 干扰，让 Charbonnier 强行对齐像素
-        if epoch > 700:
-            loss = loss_char + 0.2 * loss_ssim + 0.05 * loss_fft
-        else:
-            loss = loss_char + 0.2 * loss_ssim + 0.05 * loss_fft
+        # 🔥 完美复刻那份 23dB 代码的 Loss 组合拳
+        loss = loss_l1 + 0.5 * loss_kd + 0.1 * loss_ssim + 0.1 * loss_vgg + 0.1 * loss_edge
 
         if not torch.isfinite(loss):
             print("⚠️ Warning: Loss is NaN or Inf, skipping this batch!")
@@ -117,7 +118,7 @@ def valid(val_loader_full, network):
             output = network(source_img).clamp_(0, 1)
 
         mse_loss = F.mse_loss(output, target_img, reduction='none').mean((1, 2, 3))
-        psnr_full = 10 * torch.log10(1 / mse_loss).mean()
+        psnr_full = 10 * torch.log10(1 / (mse_loss + 1e-8)).mean()
         PSNR_full.update(psnr_full.item(), source_img.size(0))
 
         ssim_full = ssim(output, target_img, data_range=1, size_average=False).mean()
@@ -125,24 +126,50 @@ def valid(val_loader_full, network):
 
     return PSNR_full.avg, SSIM_full.avg
 
+
 if __name__ == '__main__':
     setting_filename = os.path.join('configs', args.exp, args.model + '.json')
-    print(setting_filename)
     if not os.path.exists(setting_filename):
         setting_filename = os.path.join('configs', args.exp, 'default.json')
     with open(setting_filename, 'r') as f:
         setting = json.load(f)
 
     device_index = [0]
+    
+    # ================= 实例化学生模型 =================
     network = eval(args.model.replace('-', '_'))()
     network = nn.DataParallel(network, device_ids=device_index).cuda()
-
     ema_model = AveragedModel(network, multi_avg_fn=get_ema_multi_avg_fn(0.999))
 
+    # ================= 实例化老师模型 (知识蒸馏) =================
+    print("==> 正在加载老师模型 (Teacher Model) 用于知识蒸馏...")
+    teacher_model = eval(args.model.replace('-', '_'))()
+    teacher_model = nn.DataParallel(teacher_model, device_ids=device_index).cuda()
+    
+    # 填入你指定的权重路径
+    teacher_pth = '/home/leng/data/qtacefz/new/utils/sfhformer_lol_strain_lolv2s_best.pth'
+    if os.path.exists(teacher_pth):
+        teacher_checkpoint = torch.load(teacher_pth, map_location='cuda')
+        # 处理可能存在的嵌套 state_dict
+        if 'state_dict' in teacher_checkpoint:
+            teacher_model.load_state_dict(teacher_checkpoint['state_dict'], strict=False)
+        else:
+            teacher_model.load_state_dict(teacher_checkpoint, strict=False)
+        print("🚀 老师模型加载成功！它将作为外挂指引学生模型训练。")
+    else:
+        print(f"⚠️ 警告: 未找到老师模型权重 {teacher_pth}，请检查路径！")
+        exit(1) # 如果找不到老师模型，直接退出，防止白跑
+        
+    teacher_model.eval() # 老师模型设置为评估模式
+    for param in teacher_model.parameters():
+        param.requires_grad = False # 冻结老师的所有参数
+
+    # ================= 定义 23dB 版本的 Loss =================
     criterion_char = CharbonnierLoss().cuda()
     criterion_ssim = SSIM(data_range=1.0, size_average=True, channel=3).cuda()
+    criterion_vgg = PerceptualLoss().cuda()
+    criterion_edge = EdgeAwareLoss(loss_type="l1", device="cuda").cuda()
 
-    # 🔥 核心修改 3：AdamW Beta2 改为 0.95，更适合 Transformer 动态梯度
     base_lr = setting.get('lr', 1e-3)
     if setting['optimizer'] == 'adamw':
         optimizer = torch.optim.AdamW(network.parameters(), lr=base_lr, betas=(0.9, 0.95))
@@ -151,8 +178,7 @@ if __name__ == '__main__':
     else:
         raise Exception("ERROR: unsupported optimizer")
 
-    # 🔥 核心修改 4：Warmup 衔接 CosineAnnealing
-    warmup_epochs = 50
+    warmup_epochs = 0
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=setting['epochs'] - warmup_epochs,
@@ -167,10 +193,10 @@ if __name__ == '__main__':
     generator = torch.Generator()
     generator.manual_seed(8001)
 
-    train_data_dir = '/root/lanyun-tmp/data/LOLv2/Synthetic/Train'
-    test_data_dir = '/root/lanyun-tmp/data/LOLv2/Synthetic/Test'
+    train_data_dir = '/home/leng/data/qtacefz/data/underwater_dark/Train'
+    test_data_dir = '/home/leng/data/qtacefz/data/underwater_dark/Test'
     
-    train_dataset = TrainData_for_LOLv2Synthetic(128, train_data_dir)
+    train_dataset = TrainData_for_LOLv2Synthetic(256, train_data_dir) # 建议尺寸对齐256
     train_loader = DataLoader(train_dataset,
                               batch_size=setting['batch_size'],
                               shuffle=True,
@@ -190,7 +216,7 @@ if __name__ == '__main__':
     save_dir = os.path.join(args.save_dir, args.exp)
     os.makedirs(save_dir, exist_ok=True)
 
-    test_str = 'train_lolv2s'
+    test_str = 'train_euvp_distillation' # 🔥 改个名字区分之前的实验
 
     if not os.path.exists(os.path.join(save_dir, args.model + test_str + '.pth')):
         print('==> Start training, current model name: ' + args.model)
@@ -203,20 +229,18 @@ if __name__ == '__main__':
         best_ssim_ema = 0
 
         for epoch in tqdm(range(setting['epochs'] + 1)):
-            # 🔥 核心修改 5：线性 Warmup 学习率手动覆盖
             if epoch < warmup_epochs:
                 lr = base_lr * (epoch + 1) / warmup_epochs
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = lr
 
-            # 正常执行训练，传入 epoch 以便 700 轮后切换权重
-            train_loss = train(train_loader, network, criterion_char, criterion_ssim, optimizer, ema_model, epoch)
+            # 🔥 将 teacher_model 以及新的 vgg, edge loss 传给 train 函数
+            train_loss = train(train_loader, network, teacher_model, criterion_char, criterion_ssim, criterion_vgg, criterion_edge, optimizer, ema_model, epoch)
             writer.add_scalar('train_loss', train_loss, epoch)
 
             current_lr = optimizer.param_groups[0]['lr']
             writer.add_scalar('learning_rate', current_lr, epoch)
 
-            # 保持原始保存逻辑：_newest.pth
             torch.save({'state_dict': network.state_dict()},
                        os.path.join(save_dir, args.model + test_str + '_newest' + '.pth'))
 
@@ -236,11 +260,6 @@ if __name__ == '__main__':
                     best_psnr = avg_psnr
                     torch.save({'state_dict': network.state_dict()},
                                os.path.join(save_dir, args.model + test_str + '_best' + '.pth'))
-                writer.add_scalar('best_psnr', best_psnr, epoch)
-
-                if avg_ssim > best_ssim:
-                    best_ssim = avg_ssim
-                writer.add_scalar('best_ssim', best_ssim, epoch)
                 
                 if avg_psnr_ema > best_psnr_ema:
                     best_psnr_ema = avg_psnr_ema
@@ -254,17 +273,9 @@ if __name__ == '__main__':
                     else:
                         save_content = ema_model.state_dict()
 
-                    # 保持原始 EMA 保存逻辑
                     torch.save({'state_dict': save_content},
                                os.path.join(save_dir, args.model + test_str + '_best_ema' + '.pth'))
-                
-                writer.add_scalar('best_psnr_ema', best_psnr_ema, epoch)
-                
-                if avg_ssim_ema > best_ssim_ema:
-                    best_ssim_ema = avg_ssim_ema
-                writer.add_scalar('best_ssim_ema', best_ssim_ema, epoch)
 
-            # 🔥 Warmup 结束后步进 scheduler (Cosine)
             if epoch >= warmup_epochs:
                 scheduler.step()
 

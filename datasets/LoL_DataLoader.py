@@ -18,11 +18,9 @@ def read_img255(filename):
 
 
 def augment(imgs=[], size=256, edge_decay=0., only_h_flip=False):
-    # print(f"🔧 augment 函数接收到的 size: {size}")  # ✅ 添加这一行
     H, W, _ = imgs[0].shape
     Hc, Wc = [size, size]
 
-    # simple re-weight for the edge
     if random.random() < Hc / H * edge_decay:
         Hs = 0 if random.randint(0, 1) == 0 else H - Hc
     else:
@@ -36,7 +34,6 @@ def augment(imgs=[], size=256, edge_decay=0., only_h_flip=False):
     for i in range(len(imgs)):
         imgs[i] = imgs[i][Hs:(Hs + Hc), Ws:(Ws + Wc), :]
 
-    # horizontal flip
     is_h_flip = 0
     if random.randint(0, 1) == 1:
         is_h_flip = 1
@@ -45,12 +42,12 @@ def augment(imgs=[], size=256, edge_decay=0., only_h_flip=False):
 
     rot_deg = 0
     if not only_h_flip:
-        # bad data augmentations for outdoor
         rot_deg = random.randint(0, 3)
         for i in range(len(imgs)):
             imgs[i] = np.rot90(imgs[i], rot_deg, (0, 1))
 
     return imgs, Hs, Ws, is_h_flip, rot_deg
+
 
 def align(imgs=[], size_H=448, size_W=608):
     H, W, _ = imgs[0].shape
@@ -70,10 +67,8 @@ def align_for_test(imgs=[], local_size=32):
     Hs = (H - Hc) // 2
     Ws = (W - Wc) // 2
 
-
     for i in range(len(imgs)):
         imgs[i] = imgs[i][Hs:(Hs+Hc), Ws:(Ws+Wc), :]
-        #imgs[i] = imgs[i][(H//2-224):(H//2+224), (W//2-224):(W//2+224), :]
     return imgs
 
 
@@ -81,7 +76,7 @@ def align_for_test(imgs=[], local_size=32):
 class TrainData(data.Dataset):
     def __init__(self, crop_size, train_data_dir, only_h_flip=False):
         super().__init__()
-        train_list_haze = '/root/lanyun-tmp/data/LOLdataset/our485/low/LIST.TXT'
+        train_list_haze = '/home/leng/data/qtacefz/data/LOLdataset/our485/low/LIST.TXT'
 
         with open(train_list_haze) as f:
             contents = f.readlines()
@@ -94,7 +89,6 @@ class TrainData(data.Dataset):
         self.only_h_flip = only_h_flip
 
     def get_images(self, index):
-
         haze_name = self.haze_names[index]
         gt_name = self.gt_names[index]
         haze_path = os.path.join(self.train_data_dir, 'low', haze_name)
@@ -139,7 +133,6 @@ class TrainData_for_FiveK(data.Dataset):
         self.only_h_flip = only_h_flip
 
     def get_images(self, index):
-
         haze_name = self.haze_names[index]
         gt_name = self.gt_names[index]
         haze_path = os.path.join(self.train_data_dir, 'input', haze_name)
@@ -169,7 +162,7 @@ class TrainData_for_FiveK(data.Dataset):
 class TrainData_for_LOLv2Real(data.Dataset):
     def __init__(self, crop_size, train_data_dir, only_h_flip=False):
         super().__init__()
-        train_list_haze = '/root/lanyun-tmp/data/LOLv2/Real_captured/Train/Low/Train.txt'
+        train_list_haze = '/home/leng/data/qtacefz/data/LOLv2/Real_captured/Train/Low/Train.txt'
         with open(train_list_haze) as f:
             contents = f.readlines()
             haze_names = [i.strip() for i in contents]
@@ -180,9 +173,7 @@ class TrainData_for_LOLv2Real(data.Dataset):
         self.crop_size = crop_size
         self.only_h_flip = only_h_flip
 
-
     def get_images(self, index):
-
         haze_name = self.haze_names[index]
         gt_name = self.gt_names[index]
         haze_path = os.path.join(self.train_data_dir, 'Low', haze_name)
@@ -212,11 +203,11 @@ class TrainData_for_LOLv2Real(data.Dataset):
 class TrainData_for_LOLv2Synthetic(data.Dataset):
     def __init__(self, crop_size, train_data_dir, only_h_flip=False):
         super().__init__()
-        train_list_haze = '/root/lanyun-tmp/data/LOLv2/Synthetic/Train.txt'
+        train_list_haze = '/home/leng/data/qtacefz/data/underwater_dark/Train.txt'
         with open(train_list_haze) as f:
             contents = f.readlines()
-            haze_names = [line.strip().split()[0] for line in contents]  # low图片名
-            gt_names = [line.strip().split()[1] for line in contents]    # normal图片名
+            haze_names = [line.strip().split()[0] for line in contents]
+            gt_names = [line.strip().split()[1] for line in contents]
         self.haze_names = haze_names
         self.gt_names = gt_names
         self.train_data_dir = train_data_dir
@@ -224,7 +215,6 @@ class TrainData_for_LOLv2Synthetic(data.Dataset):
         self.only_h_flip = only_h_flip
 
     def get_images(self, index):
-
         haze_name = self.haze_names[index]
         gt_name = self.gt_names[index]
         haze_path = os.path.join(self.train_data_dir, 'Low', haze_name)
@@ -233,6 +223,18 @@ class TrainData_for_LOLv2Synthetic(data.Dataset):
         cv2.ocl.setUseOpenCL(False)
         haze_img = read_img255(haze_path)
         gt_img = read_img255(gt_path)
+
+        # ===================== 水下图像专用预处理：白平衡 + 色偏矫正 =====================
+        haze_img = haze_img / 255.0
+        # 压制蓝绿色，提升红色，矫正水下色偏
+        haze_img[..., 0] = np.clip(haze_img[..., 0] * 1.15, 0, 1)  # R
+        haze_img[..., 1] = np.clip(haze_img[..., 1] * 0.90, 0, 1)  # G
+        haze_img[..., 2] = np.clip(haze_img[..., 2] * 0.85, 0, 1)  # B
+        # 暗部轻微提亮
+        haze_img = np.clip(haze_img + 0.05, 0, 1)
+        haze_img = haze_img * 255.0
+        # ==============================================================================
+
         [haze_img, gt_img], Hs, Hw, is_h_flip, rot_deg = augment([haze_img, gt_img], size=self.crop_size, edge_decay=0., only_h_flip=self.only_h_flip)
         haze_img = np.ascontiguousarray(haze_img).astype('uint8')
         gt_img = np.ascontiguousarray(gt_img).astype('uint8')
@@ -254,9 +256,7 @@ class TrainData_for_LOLv2Synthetic(data.Dataset):
 class TestData(data.Dataset):
     def __init__(self, local_size, val_data_dir, flag=True):
         super().__init__()
-
-        val_list_haze = '/root/lanyun-tmp/data/LOLdataset/eval15/low/LIST.TXT'
-
+        val_list_haze = '/home/leng/data/qtacefz/data/LOLdataset/eval15/low/LIST.TXT'
         with open(val_list_haze) as f:
             contents = f.readlines()
             haze_names = [i.strip() for i in contents]
@@ -271,7 +271,6 @@ class TestData(data.Dataset):
     def get_images(self, index):
         haze_name = self.haze_names[index]
         gt_name = self.gt_names[index]
-
         haze_path = os.path.join(self.val_data_dir, 'low', haze_name)
         gt_path = os.path.join(self.val_data_dir, 'high', gt_name)
         haze_img = read_img255(haze_path)
@@ -280,12 +279,9 @@ class TestData(data.Dataset):
         haze_img = np.ascontiguousarray(haze_img).astype('uint8')
         gt_img = np.ascontiguousarray(gt_img).astype('uint8')
         transform_haze = Compose([ToTensor()])
-        #transform_haze = Compose([ToTensor()])
         transform_gt = Compose([ToTensor()])
         haze = transform_haze(haze_img)
         gt = transform_gt(gt_img)
-
-
 
         return {'source': haze, 'target': gt, 'filename': haze_name}
 
@@ -300,9 +296,7 @@ class TestData(data.Dataset):
 class TestData_for_FiveK(data.Dataset):
     def __init__(self, local_size, val_data_dir, flag=True):
         super().__init__()
-
         val_list_haze = '/home/jxy/projects_dir/datasets/FiveK/test.txt'
-
         with open(val_list_haze) as f:
             contents = f.readlines()
             haze_names = [i.strip() for i in contents]
@@ -316,7 +310,6 @@ class TestData_for_FiveK(data.Dataset):
     def get_images(self, index):
         haze_name = self.haze_names[index]
         gt_name = self.gt_names[index]
-
         haze_path = os.path.join(self.val_data_dir, 'input', haze_name)
         gt_path = os.path.join(self.val_data_dir, 'target', gt_name)
         haze_img = read_img255(haze_path)
@@ -325,12 +318,9 @@ class TestData_for_FiveK(data.Dataset):
         haze_img = np.ascontiguousarray(haze_img).astype('uint8')
         gt_img = np.ascontiguousarray(gt_img).astype('uint8')
         transform_haze = Compose([ToTensor()])
-        #transform_haze = Compose([ToTensor()])
         transform_gt = Compose([ToTensor()])
         haze = transform_haze(haze_img)
         gt = transform_gt(gt_img)
-
-
 
         return {'source': haze, 'target': gt, 'filename': haze_name}
 
@@ -345,8 +335,7 @@ class TestData_for_FiveK(data.Dataset):
 class TestData_for_LOLv2Real(data.Dataset):
     def __init__(self, local_size, val_data_dir, flag=True):
         super().__init__()
-
-        val_list_haze = '/root/lanyun-tmp/data/LOLv2/Real_captured/Test/Low/Test.txt'
+        val_list_haze = '/home/leng/data/qtacefz/data/LOLv2/Real_captured/Test/Low/Test.txt'
         with open(val_list_haze) as f:
             contents = f.readlines()
             haze_names = [i.strip() for i in contents]
@@ -358,11 +347,9 @@ class TestData_for_LOLv2Real(data.Dataset):
         self.flag = flag
         self.local_size = local_size
 
-
     def get_images(self, index):
         haze_name = self.haze_names[index]
         gt_name = self.gt_names[index]
-
         haze_path = os.path.join(self.val_data_dir, 'Low', haze_name)
         gt_path = os.path.join(self.val_data_dir, 'Normal', gt_name)
         haze_img = read_img255(haze_path)
@@ -371,12 +358,9 @@ class TestData_for_LOLv2Real(data.Dataset):
         haze_img = np.ascontiguousarray(haze_img).astype('uint8')
         gt_img = np.ascontiguousarray(gt_img).astype('uint8')
         transform_haze = Compose([ToTensor()])
-        #transform_haze = Compose([ToTensor()])
         transform_gt = Compose([ToTensor()])
         haze = transform_haze(haze_img)
         gt = transform_gt(gt_img)
-
-
 
         return {'source': haze, 'target': gt, 'filename': haze_name}
 
@@ -391,12 +375,11 @@ class TestData_for_LOLv2Real(data.Dataset):
 class TestData_for_LOLv2Synthetic(data.Dataset):
     def __init__(self, local_size, val_data_dir, flag=True):
         super().__init__()
-
-        val_list_haze = '/root/lanyun-tmp/data/LOLv2/Synthetic/Test.txt'
+        val_list_haze = '/home/leng/data/qtacefz/data/underwater_dark/Test.txt'
         with open(val_list_haze) as f:
             contents = f.readlines()
-            haze_names = [line.strip().split()[0] for line in contents]  # low图片名
-            gt_names = [line.strip().split()[1] for line in contents]    # normal图片名
+            haze_names = [line.strip().split()[0] for line in contents]
+            gt_names = [line.strip().split()[1] for line in contents]
 
         self.haze_names = haze_names
         self.gt_names = gt_names
@@ -407,21 +390,27 @@ class TestData_for_LOLv2Synthetic(data.Dataset):
     def get_images(self, index):
         haze_name = self.haze_names[index]
         gt_name = self.gt_names[index]
-
         haze_path = os.path.join(self.val_data_dir, 'Low', haze_name)
         gt_path = os.path.join(self.val_data_dir, 'Normal', gt_name)
         haze_img = read_img255(haze_path)
         gt_img = read_img255(gt_path)
+
+        # ===================== 测试集也加入水下白平衡（效果更稳）=====================
+        haze_img = haze_img / 255.0
+        haze_img[..., 0] = np.clip(haze_img[..., 0] * 1.15, 0, 1)
+        haze_img[..., 1] = np.clip(haze_img[..., 1] * 0.90, 0, 1)
+        haze_img[..., 2] = np.clip(haze_img[..., 2] * 0.85, 0, 1)
+        haze_img = np.clip(haze_img + 0.05, 0, 1)
+        haze_img = haze_img * 255.0
+        # ==============================================================================
+
         [haze_img, gt_img] = align_for_test([haze_img, gt_img], local_size=self.local_size)
         haze_img = np.ascontiguousarray(haze_img).astype('uint8')
         gt_img = np.ascontiguousarray(gt_img).astype('uint8')
         transform_haze = Compose([ToTensor()])
-        #transform_haze = Compose([ToTensor()])
         transform_gt = Compose([ToTensor()])
         haze = transform_haze(haze_img)
         gt = transform_gt(gt_img)
-
-
 
         return {'source': haze, 'target': gt, 'filename': haze_name}
 
